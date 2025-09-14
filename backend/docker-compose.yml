@@ -1,0 +1,254 @@
+version: '3.8'
+
+services:
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ALLOWED_ORIGINS=http://localhost:3000
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - solar-crm-network
+    env_file:
+      - .env.postgres
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - solar-crm-network
+
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-crmuserdev}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - APP_USER_PASSWORD=${APP_USER_PASSWORD:-securepassword}
+      - READONLY_USER_PASSWORD=${READONLY_USER_PASSWORD:-readonlypass}
+      - POSTGRES_MULTIPLE_DATABASES=${POSTGRES_MULTIPLE_DATABASES:-solar_crm_auth,solar_crm_user_management,solar_projects,solar_crm_payments,organization_management,document_management,support_db,weather_integration}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - postgres-backups:/var/lib/postgresql/backups
+      - ./scripts/init-multiple-postgres-databases.sh:/docker-entrypoint-initdb.d/init-multiple-postgres-databases.sh
+      - ./scripts/backup-postgres.sh:/var/lib/postgresql/scripts/backup-postgres.sh
+      - ./config/postgres/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./config/postgres/backup-cron:/etc/cron.d/postgres-backup
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c ssl=off
+    networks:
+      - solar-crm-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      
+  pgbouncer:
+    image: edoburu/pgbouncer:1.18.0
+    ports:
+      - "127.0.0.1:6432:6432"
+    volumes:
+      - ./config/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./config/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - solar-crm-network
+
+  auth-service:
+    build:
+      context: ./services/auth
+    container_name: auth-service
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"
+    environment:
+      - NODE_ENV=development
+      - PORT=3001
+      - DATABASE_URL=postgresql://solar_crm_auth_app:${APP_USER_PASSWORD:-securepassword}@pgbouncer:6432/solar_crm_auth?schema=app_data&sslmode=disable&application_name=auth_service
+    depends_on:
+      - postgres
+      - redis
+      - pgbouncer
+    env_file:
+      - .env.postgres
+    networks:
+      - solar-crm-network
+
+  user-service:
+    build:
+      context: ./services/user-management
+    container_name: user-service
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3002:3002"
+    environment:
+      - NODE_ENV=development
+      - PORT=3002
+      - DATABASE_URL=postgresql://solar_crm_user_management_app:${APP_USER_PASSWORD:-securepassword}@pgbouncer:6432/solar_crm_user_management?schema=app_data&sslmode=disable&application_name=user_service
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    env_file:
+      - .env.postgres
+    networks:
+      - solar-crm-network
+
+  solar-projects-service:
+    build:
+      context: ./services/solar-projects
+    container_name: solar-projects-service
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3003:3003"
+    environment:
+      - NODE_ENV=development
+      - PORT=3003
+      - DATABASE_URL=postgresql://solar_projects_app:${APP_USER_PASSWORD:-securepassword}@pgbouncer:6432/solar_projects?schema=app_data&sslmode=disable&application_name=projects_service
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    env_file:
+      - .env.postgres
+    networks:
+      - solar-crm-network
+
+  payment-service:
+    build:
+      context: ./services/payment-processing
+    container_name: payment-service
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3004:3004"
+    environment:
+      - NODE_ENV=development
+      - PORT=3004
+      - DATABASE_URL=postgresql://solar_crm_payments_app:${APP_USER_PASSWORD:-securepassword}@pgbouncer:6432/solar_crm_payments?schema=app_data&sslmode=disable&application_name=payment_service
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    env_file:
+      - .env.postgres
+    networks:
+      - solar-crm-network
+
+  weather-service:
+    build:
+      context: ./services/weather-integration
+    container_name: weather-service
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3005:3005"
+    environment:
+      - NODE_ENV=development
+      - PORT=3005
+      - DATABASE_URL=postgresql://weather_integration_app:${APP_USER_PASSWORD:-securepassword}@pgbouncer:6432/weather_integration?schema=app_data&sslmode=disable&application_name=weather_service
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    env_file:
+      - .env.postgres
+    networks:
+      - solar-crm-network
+
+  # Monitoring services
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/postgres?sslmode=disable
+    ports:
+      - "127.0.0.1:9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - solar-crm-network
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    ports:
+      - "127.0.0.1:9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - solar-crm-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./config/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./config/monitoring/postgres_alerts.yml:/etc/prometheus/rules/postgres_alerts.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - solar-crm-network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    networks:
+      - solar-crm-network
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    networks:
+      - solar-crm-network
+
+networks:
+  solar-crm-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+  postgres-data:
+  postgres-backups:
+  prometheus_data:
+  grafana_data:
+  alertmanager_data:
